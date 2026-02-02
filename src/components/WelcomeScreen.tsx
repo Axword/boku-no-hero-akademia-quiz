@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { useGame } from '../context/GameContext';
 import { Lobby } from './Lobby';
-import { HelpCircle, Users, Play } from 'lucide-react';
+import { HelpCircle, Users, Play, User } from 'lucide-react';
 
 export const WelcomeScreen = () => {
-  const { createGame, joinGame, roomCode, playSound } = useGame();
+  const { createGame, joinGame, roomCode, playSound, startSinglePlayer } = useGame();
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
   const [mode, setMode] = useState<'menu' | 'join' | 'tutorial'>('menu');
@@ -17,6 +17,12 @@ export const WelcomeScreen = () => {
     if (!name.trim()) return alert('Podaj imię!');
     playSound('click');
     createGame(name);
+  };
+
+  const handleSinglePlayer = () => {
+    if (!name.trim()) return alert('Podaj imię!');
+    playSound('click');
+    startSinglePlayer(name);
   };
 
   const handleJoin = () => {
@@ -54,8 +60,8 @@ export const WelcomeScreen = () => {
       <div className="bg-white border-4 border-black p-8 w-full comic-shadow">
         
         {mode === 'menu' && (
-          <div className="space-y-6">
-            <div className="text-center space-y-2">
+          <div className="space-y-4">
+            <div className="text-center space-y-2 mb-6">
               <label className="block text-2xl font-black font-display uppercase">Twoje Imię BOHATERA</label>
               <input
                 type="text"
@@ -71,6 +77,13 @@ export const WelcomeScreen = () => {
               className="w-full flex items-center justify-center gap-3 bg-red-600 hover:bg-red-700 text-white font-black font-display tracking-widest text-2xl py-4 border-4 border-black comic-shadow-sm comic-shadow-active transition-all"
             >
               <Play size={28} strokeWidth={3} /> STWÓRZ POKÓJ
+            </button>
+
+            <button
+              onClick={handleSinglePlayer}
+              className="w-full flex items-center justify-center gap-3 bg-yellow-400 hover:bg-yellow-500 text-black font-black font-display tracking-widest text-2xl py-4 border-4 border-black comic-shadow-sm comic-shadow-active transition-all"
+            >
+              <User size={28} strokeWidth={3} /> SOLO MISJA
             </button>
 
             <button

@@ -37,6 +37,8 @@ export interface GameContextType {
   submitAnswer: (answer: string) => void;
   playAgain: () => void;
   playSound: (type: 'correct' | 'wrong' | 'click' | 'turn' | 'join') => void;
+  startSinglePlayer: (name: string) => void;
+  isSinglePlayer: boolean;
 }
 
 const GameContext = createContext<GameContextType | undefined>(undefined);
@@ -57,6 +59,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [connections, setConnections] = useState<DataConnection[]>([]);
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
+  const [isSinglePlayer, setIsSinglePlayer] = useState(false);
   const hostConnection = useRef<DataConnection | null>(null);
 
   // Game State
@@ -87,41 +90,80 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
+  // --- Ref for Event Listeners ---
+  // We use a ref to hold the latest state so event listeners (which are bound once)
+  // can access the current state without being re-bound.
+  const stateRef = useRef({
+    players,
+    gameState,
+    currentTurnPlayerId,
+    answers,
+    isSinglePlayer,
+    isHost
+  });
+
+  useEffect(() => {
+    stateRef.current = {
+      players,
+      gameState,
+      currentTurnPlayerId,
+      answers,
+      isSinglePlayer,
+      isHost
+    };
+  }, [players, gameState, currentTurnPlayerId, answers, isSinglePlayer, isHost]);
+
   // --- Host Logic: Handling Incoming Connections ---
   useEffect(() => {
-    if (!peer || !isHost) return;
+    if (!peer) return;
 
-    peer.on('connection', (conn) => {
+    // Only set up the connection listener ONCE per peer instance
+    const handleConnection = (conn: DataConnection) => {
       conn.on('open', () => {
-        // New player joining
+        setConnections(prev => [...prev, conn]);
+        
         conn.on('data', (data: any) => {
-          handleHostReceiveData(conn, data);
+          // Use Ref to access latest state
+          const currentState = stateRef.current;
+          
+          if (!currentState.isHost && !currentState.isSinglePlayer) return; // Only host processes data
+          
+          handleHostReceiveData(conn, data, currentState);
         });
+        
+        // Send initial state if we are already in a game
+        if (stateRef.current.isHost) {
+            // Slight delay to ensure connection is ready
+            setTimeout(() => broadcastState(), 100);
+        }
       });
       
-      setConnections(prev => [...prev, conn]);
-    });
-  }, [peer, isHost, players, gameState]); // Deps might need tuning to avoid stale closures if not careful, but handleHostReceiveData will access state via Refs or setState callbacks if needed.
-  // Actually, for complex state in event listeners, it's better to use refs or functional updates.
+      conn.on('close', () => {
+          setConnections(prev => prev.filter(c => c !== conn));
+          setPlayers(prev => prev.filter(p => p.id !== conn.peer));
+      });
+    };
 
-  // --- Client Logic: Handling Connection to Host ---
-  useEffect(() => {
-    if (!peer || isHost) return;
-    // Client listeners are set up in joinGame
-  }, [peer, isHost]);
+    peer.on('connection', handleConnection);
+
+    return () => {
+      peer.off('connection', handleConnection);
+    };
+  }, [peer]); // Only depend on peer
 
 
   // --- Game Loop (Host Only) ---
   useEffect(() => {
     if (!isHost) return;
-
     // Broadcast state whenever it changes
     broadcastState();
-  }, [players, gameState, currentTurnPlayerId, currentCategory, currentQuestion, answers, timeLeft]);
+  }, [players, gameState, currentTurnPlayerId, currentCategory, currentQuestion, answers, timeLeft, isHost]);
 
 
   // --- Helper: Broadcast ---
   const broadcastState = () => {
+    if (isSinglePlayer) return;
+
     const state = {
       type: 'UPDATE_STATE',
       payload: {
@@ -141,9 +183,16 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   // --- Host Logic: Data Handler ---
-  const handleHostReceiveData = (conn: DataConnection, data: any) => {
+  // Now accepts currentState as argument to avoid closure staleness
+  const handleHostReceiveData = (conn: DataConnection, data: any, currentState: any) => {
     switch (data.type) {
       case 'JOIN_REQUEST':
+        // Check if game is in lobby
+        if (currentState.gameState !== 'LOBBY') {
+          // Reject
+          return;
+        }
+        
         const newPlayer: Player = {
           id: conn.peer,
           name: data.name,
@@ -151,11 +200,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
           isHost: false,
           avatarId: Math.floor(Math.random() * 5)
         };
-        // Check if game is in lobby
-        if (gameState !== 'LOBBY') {
-          // Reject (Optional: could implement spectator)
-          return;
-        }
         
         setPlayers(prev => {
            if (prev.find(p => p.id === newPlayer.id)) return prev;
@@ -165,19 +209,17 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         break;
 
       case 'SELECT_CATEGORY':
-        if (gameState === 'CATEGORY_SELECT' && conn.peer === currentTurnPlayerId) {
+        if (currentState.gameState === 'CATEGORY_SELECT' && conn.peer === currentState.currentTurnPlayerId) {
           handleCategorySelected(data.category);
         }
         break;
 
       case 'SUBMIT_ANSWER':
-        if (gameState === 'QUESTION') {
-           setAnswers(prev => ({
-             ...prev,
-             [conn.peer]: data.answer
-           }));
-           // If all players answered, maybe fast forward?
-           // For now, wait for timer.
+        if (currentState.gameState === 'QUESTION') {
+           setAnswers(prev => {
+               const newAnswers = { ...prev, [conn.peer]: data.answer };
+               return newAnswers;
+           });
         }
         break;
     }
@@ -197,6 +239,27 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       avatarId: Math.floor(Math.random() * 5)
     }]);
     setGameState('LOBBY');
+  };
+
+  const startSinglePlayer = (name: string) => {
+    const fakeId = myPeerId || `SP_${Math.floor(Math.random() * 10000)}`;
+    setMyPeerId(fakeId);
+    setIsHost(true);
+    setIsSinglePlayer(true);
+    setRoomCode('SINGLE_PLAYER');
+    
+    const player: Player = {
+        id: fakeId,
+        name,
+        score: 0,
+        isHost: true,
+        avatarId: Math.floor(Math.random() * 5)
+    };
+    
+    setPlayers([player]);
+    setCurrentTurnPlayerId(fakeId);
+    setGameState('CATEGORY_SELECT');
+    playSound('turn');
   };
 
   const joinGame = (code: string, name: string) => {
@@ -230,9 +293,8 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const startGame = () => {
     if (!isHost) return;
-    if (players.length < 1) return; // Allow solo for testing, but prompt says multiplayer.
+    if (players.length < 1) return; 
     
-    // Pick random starting player
     const randomIdx = Math.floor(Math.random() * players.length);
     setCurrentTurnPlayerId(players[randomIdx].id);
     setGameState('CATEGORY_SELECT');
@@ -246,9 +308,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const availableQuestions = questions.filter(q => q.category === category && !usedQuestionIds.has(q.id));
     
     if (availableQuestions.length === 0) {
-      // Fallback if we run out of questions in a category (unlikely with 100+ but possible)
-      // Just pick any random question or reset used
-      // For now, pick a random one from category even if used
       const anyCatQuestions = questions.filter(q => q.category === category);
       const randomQ = anyCatQuestions[Math.floor(Math.random() * anyCatQuestions.length)];
       startQuestion(randomQ);
@@ -260,20 +319,30 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const startQuestion = (question: Question) => {
-    setCurrentQuestion(question);
+    // Shuffle options to prevent predictable answer positions
+    const shuffledOptions = [...question.options];
+    for (let i = shuffledOptions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffledOptions[i], shuffledOptions[j]] = [shuffledOptions[j], shuffledOptions[i]];
+    }
+    const questionWithShuffledOptions = { ...question, options: shuffledOptions };
+
+    setCurrentQuestion(questionWithShuffledOptions);
     setAnswers({});
     setGameState('QUESTION');
     setTimeLeft(15); // 15 seconds to answer
     playSound('turn');
 
-    // Timer Logic
-    if (timerRef.current) window.clearInterval(timerRef.current);
+    if (timerRef.current) {
+        window.clearInterval(timerRef.current);
+        timerRef.current = null;
+    }
     
-    // We only decrement here. The end condition is handled by the useEffect watching timeLeft.
     const interval = window.setInterval(() => {
       setTimeLeft(prev => {
         if (prev <= 0) {
-          window.clearInterval(interval);
+          // Interval will be cleared by the useEffect cleanup when state changes
+          // or we can safely return 0 here.
           return 0;
         }
         return prev - 1;
@@ -281,6 +350,16 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }, 1000);
     timerRef.current = interval;
   };
+
+  // CRITICAL: Cleanup timer when NOT in QUESTION state
+  useEffect(() => {
+    if (gameState !== 'QUESTION') {
+        if (timerRef.current) {
+            window.clearInterval(timerRef.current);
+            timerRef.current = null;
+        }
+    }
+  }, [gameState]);
 
   // FIX: Timer and Round End Logic
   useEffect(() => {
@@ -317,23 +396,22 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
      if (!isHost) return;
      if (gameState === 'ROUND_RESULT') {
+         const timeoutDuration = isSinglePlayer ? 1000 : 2500;
          const timer = setTimeout(() => {
              const currentPlayers = playersRef.current;
              const currentTurnId = currentTurnPlayerIdRef.current;
              
              const currentPlayerIdx = currentPlayers.findIndex(p => p.id === currentTurnId);
-             // Handle if player left?
-             const safeIdx = currentPlayerIdx === -1 ? 0 : currentPlayerIdx;
              
-             const nextPlayerIdx = (safeIdx + 1) % currentPlayers.length;
+             const nextPlayerIdx = (currentPlayerIdx + 1) % currentPlayers.length;
              setCurrentTurnPlayerId(currentPlayers[nextPlayerIdx].id);
              
              setGameState('CATEGORY_SELECT');
              playSound('turn');
-         }, 5000);
+         }, timeoutDuration);
          return () => clearTimeout(timer);
      }
-  }, [gameState, isHost]); // Only trigger when entering ROUND_RESULT
+  }, [gameState, isHost, isSinglePlayer]);
 
   const selectCategory = (category: Category) => {
     if (isHost) {
@@ -344,22 +422,39 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const submitAnswer = (answer: string) => {
+    // Safety check: don't accept answers if time is up
+    if (timeLeft <= 0 && gameState === 'QUESTION') return;
+
     if (isHost) {
-       setAnswers(prev => ({ ...prev, [myPeerId!]: answer }));
+       setAnswers(prev => {
+           // Prevent answering twice
+           if (prev[myPeerId!]) return prev;
+           return { ...prev, [myPeerId!]: answer };
+       });
+       
+       if (isSinglePlayer) {
+         // Instant feedback for single player
+         // Force timer to 0 to trigger Round End
+         setTimeLeft(0);
+       }
     } else {
        hostConnection.current?.send({ type: 'SUBMIT_ANSWER', answer });
     }
   };
   
   const playAgain = () => {
-      // Reset scores but keep players
       if(isHost) {
           setPlayers(prev => prev.map(p => ({...p, score: 0})));
-          setGameState('LOBBY');
+          setUsedQuestionIds(new Set()); // Reset used questions
+          if (isSinglePlayer) {
+              setGameState('CATEGORY_SELECT');
+          } else {
+              setGameState('LOBBY');
+          }
       }
   };
 
-  const winner = null; // Calculated if needed
+  const winner = null;
 
   return (
     <GameContext.Provider value={{
@@ -373,6 +468,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       timeLeft,
       winner,
       isHost,
+      isSinglePlayer,
       roomCode,
       createGame,
       joinGame,
@@ -380,7 +476,8 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       selectCategory,
       submitAnswer,
       playAgain,
-      playSound
+      playSound,
+      startSinglePlayer
     }}>
       {children}
     </GameContext.Provider>
